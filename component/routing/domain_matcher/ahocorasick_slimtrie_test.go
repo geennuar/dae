@@ -1,16 +1,17 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2023, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
  */
 
 package domain_matcher
 
 import (
+	"math/rand"
+	"testing"
+
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/exp/slices"
-	"math/rand"
-	"testing"
 )
 
 func TestAhocorasickSlimtrie(t *testing.T) {

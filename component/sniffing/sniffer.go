@@ -1,19 +1,21 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2023, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
  */
 
 package sniffing
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"time"
 
 	"github.com/daeuniverse/dae/component/sniffing/internal/quicutils"
-	"github.com/daeuniverse/softwind/pool"
-	"github.com/daeuniverse/softwind/pool/bytes"
+	"github.com/daeuniverse/outbound/pool"
+	"github.com/daeuniverse/outbound/pool/bytes"
 )
 
 type Sniffer struct {
@@ -37,7 +39,7 @@ type Sniffer struct {
 	quicCryptos  []*quicutils.CryptoFrameOffset
 }
 
-func NewStreamSniffer(r io.Reader, bufSize int, timeout time.Duration) *Sniffer {
+func NewStreamSniffer(r io.Reader, timeout time.Duration) *Sniffer {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	buffer := pool.GetBuffer()
 	buffer.Grow(AssumedTlsClientHelloMaxLength)
@@ -75,7 +77,7 @@ func sniffGroup(sniffs ...sniff) (d string, err error) {
 	for _, sniffer := range sniffs {
 		d, err = sniffer()
 		if err == nil {
-			return d, nil
+			return NormalizeDomain(d), nil
 		}
 		if err != ErrNotApplicable {
 			return "", err
@@ -95,38 +97,52 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 	}()
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
-	if s.stream {
-		go func() {
-			// Read once.
-			_, err := s.buf.ReadFromOnce(s.r)
-			if err != nil {
-				s.dataError = err
-			}
-			close(s.dataReady)
-		}()
+	var oerr error
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("%w: %w", oerr, err)
+		}
+	}()
+	for {
+		if s.stream {
+			go func() {
+				// Read once.
+				_, err = s.buf.ReadFromOnce(s.r)
+				if err != nil {
+					s.dataError = err
+				}
+				close(s.dataReady)
+			}()
 
-		// Waiting 100ms for data.
-		select {
-		case <-s.dataReady:
-			if s.dataError != nil {
-				return "", s.dataError
+			// Waiting 100ms for data.
+			select {
+			case <-s.dataReady:
+				if s.dataError != nil {
+					return "", s.dataError
+				}
+			case <-s.ctx.Done():
+				return "", fmt.Errorf("%w: %w", ErrNotApplicable, context.DeadlineExceeded)
 			}
-		case <-s.ctx.Done():
+		} else {
+			close(s.dataReady)
+		}
+
+		if s.buf.Len() == 0 {
 			return "", ErrNotApplicable
 		}
-	} else {
-		close(s.dataReady)
-	}
 
-	if s.buf.Len() == 0 {
-		return "", ErrNotApplicable
+		d, err = sniffGroup(
+			// Most sniffable traffic is TLS, thus we sniff it first.
+			s.SniffTls,
+			s.SniffHttp,
+		)
+		if errors.Is(err, ErrNeedMore) {
+			oerr = err
+			s.dataReady = make(chan struct{})
+			continue
+		}
+		return d, err
 	}
-
-	return sniffGroup(
-		// Most sniffable traffic is TLS, thus we sniff it first.
-		s.SniffTls,
-		s.SniffHttp,
-	)
 }
 
 func (s *Sniffer) SniffUdp() (d string, err error) {

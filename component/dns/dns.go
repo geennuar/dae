@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2023, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
  */
 
 package dns
@@ -128,7 +128,7 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 
 func (s *Dns) CheckUpstreamsFormat() error {
 	for _, upstream := range s.upstream {
-		_, _, _, err := ParseRawUpstream(upstream.Raw)
+		_, _, _, _, err := ParseRawUpstream(upstream.Raw)
 		if err != nil {
 			return err
 		}
@@ -141,7 +141,10 @@ func (s *Dns) InitUpstreams() {
 	for _, upstream := range s.upstream {
 		wg.Add(1)
 		go func(upstream *UpstreamResolver) {
-			upstream.GetUpstream()
+			_, err := upstream.GetUpstream()
+			if err != nil {
+				s.log.WithError(err).Debugln("Dns.GetUpstream")
+			}
 			wg.Done()
 		}(upstream)
 	}

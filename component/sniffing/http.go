@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2023, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
  */
 
 package sniffing
@@ -60,7 +60,7 @@ func (s *Sniffer) SniffHttp() (d string, err error) {
 			continue
 		}
 		if strings.EqualFold(string(key), "host") {
-			return strings.TrimSpace(string(value)), nil
+			return string(value), nil
 		}
 	}
 	return "", ErrNotFound

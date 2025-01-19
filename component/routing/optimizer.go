@@ -1,21 +1,22 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2023, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
  */
 
 package routing
 
 import (
 	"fmt"
+	"net/netip"
+	"sort"
+	"strings"
+
 	"github.com/daeuniverse/dae/common/assets"
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/daeuniverse/dae/pkg/geodata"
 	"github.com/mohae/deepcopy"
 	"github.com/sirupsen/logrus"
-	"net/netip"
-	"sort"
-	"strings"
 )
 
 type RulesOptimizer interface {
@@ -87,6 +88,7 @@ func (o *MergeAndSortRulesOptimizer) Optimize(rules []*config_parser.RoutingRule
 		if len(mergingRule.AndFunctions) == 1 &&
 			len(rules[i].AndFunctions) == 1 &&
 			mergingRule.AndFunctions[0].Name == rules[i].AndFunctions[0].Name &&
+			mergingRule.AndFunctions[0].Not == rules[i].AndFunctions[0].Not &&
 			rules[i].Outbound.String(true, false, true) == mergingRule.Outbound.String(true, false, true) {
 			mergingRule.AndFunctions[0].Params = append(mergingRule.AndFunctions[0].Params, rules[i].AndFunctions[0].Params...)
 		} else {

@@ -1,3 +1,8 @@
+/*
+*  SPDX-License-Identifier: AGPL-3.0-only
+*  Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
+ */
+
 // Package trie is modified from https://github.com/openacid/succinct/blob/loc100/sskv.go.
 // Slower than about 30% but more than 40% memory saving.
 
@@ -11,7 +16,7 @@ import (
 
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/bitlist"
-	"github.com/daeuniverse/softwind/pool"
+	"github.com/daeuniverse/outbound/pool"
 )
 
 var ValidCidrChars = NewValidChars([]byte{'0', '1'})

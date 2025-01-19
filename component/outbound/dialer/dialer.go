@@ -1,3 +1,8 @@
+/*
+*  SPDX-License-Identifier: AGPL-3.0-only
+*  Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
+ */
+
 package dialer
 
 import (
@@ -5,8 +10,12 @@ import (
 	"fmt"
 	"sync"
 	"time"
+	"unsafe"
 
-	"github.com/daeuniverse/softwind/netproxy"
+	"github.com/daeuniverse/dae/common"
+	"github.com/daeuniverse/dae/config"
+	D "github.com/daeuniverse/outbound/dialer"
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/sirupsen/logrus"
 )
 
@@ -29,33 +38,47 @@ type Dialer struct {
 	checkCh  chan time.Time
 	ctx      context.Context
 	cancel   context.CancelFunc
+
+	checkActivated bool
 }
 
 type GlobalOption struct {
+	D.ExtraOption
 	Log               *logrus.Logger
 	TcpCheckOptionRaw TcpCheckOptionRaw // Lazy parse
 	CheckDnsOptionRaw CheckDnsOptionRaw // Lazy parse
 	CheckInterval     time.Duration
 	CheckTolerance    time.Duration
 	CheckDnsTcp       bool
-	AllowInsecure     bool
-	TlsImplementation string
-	UtlsImitate       string
 }
 
 type InstanceOption struct {
-	CheckEnabled bool
+	DisableCheck bool
 }
 
 type Property struct {
-	Name            string
-	Address         string
-	Protocol        string
-	Link            string
+	D.Property
 	SubscriptionTag string
 }
 
 type AliveDialerSetSet map[*AliveDialerSet]int
+
+func NewGlobalOption(global *config.Global, log *logrus.Logger) *GlobalOption {
+	return &GlobalOption{
+		ExtraOption: D.ExtraOption{
+			AllowInsecure:     global.AllowInsecure,
+			TlsImplementation: global.TlsImplementation,
+			UtlsImitate:       global.UtlsImitate,
+			BandwidthMaxTx:    global.BandwidthMaxTx,
+			BandwidthMaxRx:    global.BandwidthMaxRx},
+		Log:               log,
+		TcpCheckOptionRaw: TcpCheckOptionRaw{Raw: global.TcpCheckUrl, Log: log, ResolverNetwork: common.MagicNetwork("udp", global.SoMarkFromDae, global.Mptcp), Method: global.TcpCheckHttpMethod},
+		CheckDnsOptionRaw: CheckDnsOptionRaw{Raw: global.UdpCheckDns, ResolverNetwork: common.MagicNetwork("udp", global.SoMarkFromDae, global.Mptcp), Somark: global.SoMarkFromDae},
+		CheckInterval:     global.CheckInterval,
+		CheckTolerance:    global.CheckTolerance,
+		CheckDnsTcp:       true,
+	}
+}
 
 // NewDialer is for register in general.
 func NewDialer(dialer netproxy.Dialer, option *GlobalOption, iOption InstanceOption, property *Property) *Dialer {
@@ -77,10 +100,14 @@ func NewDialer(dialer netproxy.Dialer, option *GlobalOption, iOption InstanceOpt
 		ctx:              ctx,
 		cancel:           cancel,
 	}
-	if iOption.CheckEnabled {
-		go d.aliveBackground()
-	}
+	option.Log.WithField("dialer", d.Property().Name).
+		WithField("p", unsafe.Pointer(d)).
+		Traceln("NewDialer")
 	return d
+}
+
+func (d *Dialer) Clone() *Dialer {
+	return NewDialer(d.Dialer, d.GlobalOption, d.InstanceOption, d.property)
 }
 
 func (d *Dialer) Close() error {

@@ -10,7 +10,7 @@ For every LAN interfaces you want to proxy:
 ```shell
 export lan_ifname=docker0
 
-sudo tee /etc/sysctl.d/60-dae-$lan_ifname.conf << EOF
+sudo tee /etc/sysctl.d/60-dae-lan-$lan_ifname.conf << EOF
 net.ipv4.conf.$lan_ifname.forwarding = 1
 net.ipv6.conf.$lan_ifname.forwarding = 1
 net.ipv4.conf.$lan_ifname.send_redirects = 0
@@ -18,11 +18,29 @@ EOF
 sudo sysctl --system
 ```
 
-It is also recommended to enable IPv4 forward to avoid weird situations:
+It is also recommended to enable IPv4 and IPv6 forward to avoid weird situations:
 
 ```shell
 echo "net.ipv4.ip_forward = 1" | sudo tee /etc/sysctl.d/60-ip-forward.conf
+echo "net.ipv6.conf.all.forwarding = 1" | sudo tee /etc/sysctl.d/60-ip-forward.conf
 sudo sysctl --system
 ```
 
 Please modify `docker0` to your LAN interface.
+
+For your WAN interfaces that accept RA:
+
+```shell
+export wan_ifname=eth0
+
+if [ "$(cat /proc/sys/net/ipv6/conf/$wan_ifname/accept_ra)" == "1" ]; then
+    sudo tee /etc/sysctl.d/60-dae-wan-$wan_ifname.conf << EOF
+net.ipv6.conf.$wan_ifname.accept_ra = 2
+EOF
+    sudo sysctl --system
+fi
+```
+
+Please modify `eth0` to your WAN interface.
+
+Setting accept_ra to 2 if it is 1 because `net.ipv6.conf.all.forwarding = 1` will suppress it. See <https://sysctl-explorer.net/net/ipv6/accept_ra/> for more information.

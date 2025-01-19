@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2023, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
  */
 
 package control
@@ -37,7 +37,7 @@ type PacketSnifferKey struct {
 	RAddr netip.AddrPort
 }
 
-var DefaultPacketSnifferPool = NewPacketSnifferPool()
+var DefaultPacketSnifferSessionMgr = NewPacketSnifferPool()
 
 func NewPacketSnifferPool() *PacketSnifferPool {
 	return &PacketSnifferPool{}

@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2023, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
  */
 
 package dialer
@@ -19,15 +19,16 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/daeuniverse/dae/common"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/netutils"
-	"github.com/daeuniverse/softwind/netproxy"
-	"github.com/daeuniverse/softwind/pkg/fastrand"
-	"github.com/daeuniverse/softwind/pool"
-	"github.com/daeuniverse/softwind/protocol/direct"
+	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/pkg/fastrand"
+	"github.com/daeuniverse/outbound/pool"
+	"github.com/daeuniverse/outbound/protocol/direct"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
 )
@@ -272,19 +273,20 @@ type CheckOption struct {
 func (d *Dialer) ActivateCheck() {
 	d.tickerMu.Lock()
 	defer d.tickerMu.Unlock()
-	if d.InstanceOption.CheckEnabled {
+	if d.InstanceOption.DisableCheck || d.checkActivated {
 		return
 	}
-	d.InstanceOption.CheckEnabled = true
+	d.checkActivated = true
 	go d.aliveBackground()
 }
 
 func (d *Dialer) aliveBackground() {
-	timeout := Timeout
 	cycle := d.CheckInterval
 	var tcpSomark uint32
+	var mptcp bool
 	if network, err := netproxy.ParseMagicNetwork(d.TcpCheckOptionRaw.ResolverNetwork); err == nil {
 		tcpSomark = network.Mark
+		mptcp = network.Mptcp
 	}
 	tcp4CheckOpt := &CheckOption{
 		networkType: &NetworkType{
@@ -305,7 +307,7 @@ func (d *Dialer) aliveBackground() {
 				}).Debugln("Skip check due to no DNS record.")
 				return false, nil
 			}
-			return d.HttpCheck(ctx, opt.Url, opt.Ip4, opt.Method, tcpSomark)
+			return d.HttpCheck(ctx, opt.Url, opt.Ip4, opt.Method, tcpSomark, mptcp)
 		},
 	}
 	tcp6CheckOpt := &CheckOption{
@@ -327,7 +329,7 @@ func (d *Dialer) aliveBackground() {
 				}).Debugln("Skip check due to no DNS record.")
 				return false, nil
 			}
-			return d.HttpCheck(ctx, opt.Url, opt.Ip6, opt.Method, tcpSomark)
+			return d.HttpCheck(ctx, opt.Url, opt.Ip6, opt.Method, tcpSomark, mptcp)
 		},
 	}
 	tcpNetwork := netproxy.MagicNetwork{
@@ -451,6 +453,18 @@ func (d *Dialer) aliveBackground() {
 			}
 		}
 	}()
+	var unused int
+	for _, opt := range CheckOpts {
+		if len(d.mustGetCollection(opt.networkType).AliveDialerSetSet) == 0 {
+			unused++
+		}
+	}
+	if unused == len(CheckOpts) {
+		d.Log.WithField("dialer", d.Property().Name).
+			WithField("p", unsafe.Pointer(d)).
+			Traceln("cleaned up due to unused")
+		return
+	}
 	var wg sync.WaitGroup
 	for range d.checkCh {
 		for _, opt := range CheckOpts {
@@ -461,7 +475,7 @@ func (d *Dialer) aliveBackground() {
 
 			wg.Add(1)
 			go func(opt *CheckOption) {
-				_, _ = d.Check(timeout, opt)
+				_, _ = d.Check(opt)
 				wg.Done()
 			}(opt)
 		}
@@ -513,10 +527,48 @@ func (d *Dialer) UnregisterAliveDialerSet(a *AliveDialerSet) {
 	}
 }
 
-func (d *Dialer) Check(timeout time.Duration,
-	opts *CheckOption,
-) (ok bool, err error) {
-	ctx, cancel := context.WithTimeout(context.TODO(), timeout)
+func (d *Dialer) logUnavailable(
+	collection *collection,
+	network *NetworkType,
+	err error,
+) {
+	// Append timeout if there is any error or unexpected status code.
+	if err != nil {
+		if strings.HasSuffix(err.Error(), "network is unreachable") {
+			err = fmt.Errorf("network is unreachable")
+		} else if strings.HasSuffix(err.Error(), "no suitable address found") ||
+			strings.HasSuffix(err.Error(), "non-IPv4 address") {
+			err = fmt.Errorf("IPv%v is not supported", network.IpVersion)
+		}
+		d.Log.WithFields(logrus.Fields{
+			"network": network.String(),
+			"node":    d.property.Name,
+			"err":     err.Error(),
+		}).Debugln("Connectivity Check Failed")
+	}
+	collection.Latencies10.AppendLatency(Timeout)
+	collection.MovingAverage = (collection.MovingAverage + Timeout) / 2
+	collection.Alive = false
+}
+
+func (d *Dialer) informDialerGroupUpdate(collection *collection) {
+	// Inform DialerGroups to update state.
+	// We use lock because AliveDialerSetSet is a reference of that in collection.
+	d.collectionFineMu.Lock()
+	for a := range collection.AliveDialerSetSet {
+		a.NotifyLatencyChange(d, collection.Alive)
+	}
+	d.collectionFineMu.Unlock()
+}
+
+func (d *Dialer) ReportUnavailable(typ *NetworkType, err error) {
+	collection := d.mustGetCollection(typ)
+	d.logUnavailable(collection, typ, err)
+	d.informDialerGroupUpdate(collection)
+}
+
+func (d *Dialer) Check(opts *CheckOption) (ok bool, err error) {
+	ctx, cancel := context.WithTimeout(context.TODO(), Timeout)
 	defer cancel()
 	start := time.Now()
 	// Calc latency.
@@ -537,45 +589,22 @@ func (d *Dialer) Check(timeout time.Duration,
 			"mov_avg": collection.MovingAverage.Truncate(time.Millisecond),
 		}).Debugln("Connectivity Check")
 	} else {
-		// Append timeout if there is any error or unexpected status code.
-		if err != nil {
-			if strings.HasSuffix(err.Error(), "network is unreachable") {
-				err = fmt.Errorf("network is unreachable")
-			} else if strings.HasSuffix(err.Error(), "no suitable address found") ||
-				strings.HasSuffix(err.Error(), "non-IPv4 address") {
-				err = fmt.Errorf("IPv%v is not supported", opts.networkType.IpVersion)
-			}
-			d.Log.WithFields(logrus.Fields{
-				"network": opts.networkType.String(),
-				"node":    d.property.Name,
-				"err":     err.Error(),
-			}).Debugln("Connectivity Check Failed")
-		}
-		collection.Latencies10.AppendLatency(timeout)
-		collection.MovingAverage = (collection.MovingAverage + timeout) / 2
-		collection.Alive = false
+		d.logUnavailable(collection, opts.networkType, err)
 	}
-	// Inform DialerGroups to update state.
-	// We use lock because AliveDialerSetSet is a reference of that in collection.
-	d.collectionFineMu.Lock()
-	for a := range collection.AliveDialerSetSet {
-		a.NotifyLatencyChange(d, collection.Alive)
-	}
-	d.collectionFineMu.Unlock()
+	d.informDialerGroupUpdate(collection)
 	return ok, err
 }
 
-func (d *Dialer) HttpCheck(ctx context.Context, u *netutils.URL, ip netip.Addr, method string, soMark uint32) (ok bool, err error) {
+func (d *Dialer) HttpCheck(ctx context.Context, u *netutils.URL, ip netip.Addr, method string, soMark uint32, mptcp bool) (ok bool, err error) {
 	// HTTP(S) check.
 	if method == "" {
 		method = http.MethodGet
 	}
-	cd := &netproxy.ContextDialerConverter{Dialer: d.Dialer}
 	cli := http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (c net.Conn, err error) {
 				// Force to dial "ip".
-				conn, err := cd.DialContext(ctx, common.MagicNetwork("tcp", soMark), net.JoinHostPort(ip.String(), u.Port()))
+				conn, err := d.Dialer.DialContext(ctx, common.MagicNetwork("tcp", soMark, mptcp), net.JoinHostPort(ip.String(), u.Port()))
 				if err != nil {
 					return nil, err
 				}

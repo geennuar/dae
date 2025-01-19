@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2023, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
  */
 
 package control
@@ -21,6 +21,8 @@ import (
 
 	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/assets"
@@ -33,10 +35,10 @@ import (
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
-	"github.com/daeuniverse/softwind/pool"
-	"github.com/daeuniverse/softwind/protocol/direct"
-	"github.com/daeuniverse/softwind/transport/grpc"
-	"github.com/daeuniverse/softwind/transport/meek"
+	"github.com/daeuniverse/outbound/pool"
+	"github.com/daeuniverse/outbound/protocol/direct"
+	"github.com/daeuniverse/outbound/transport/grpc"
+	"github.com/daeuniverse/outbound/transport/meek"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/mohae/deepcopy"
 	"github.com/sirupsen/logrus"
@@ -74,6 +76,7 @@ type ControlPlane struct {
 	sniffingTimeout   time.Duration
 	tproxyPortProtect bool
 	soMarkFromDae     uint32
+	mptcp             bool
 }
 
 func NewControlPlane(
@@ -87,6 +90,11 @@ func NewControlPlane(
 	dnsConfig *config.Dns,
 	externGeoDataDirs []string,
 ) (*ControlPlane, error) {
+	// TODO: Some users reported that enabling GSO on the client would affect the performance of watching YouTube, so we disabled it by default.
+	if _, ok := os.LookupEnv("QUIC_GO_DISABLE_GSO"); !ok {
+		os.Setenv("QUIC_GO_DISABLE_GSO", "1")
+	}
+
 	var err error
 
 	kernelVersion, e := internal.KernelVersion()
@@ -95,12 +103,18 @@ func NewControlPlane(
 	}
 	/// Check linux kernel requirements.
 	// Check version from high to low to reduce the number of user upgrading kernel.
+	if err := features.HaveProgramHelper(ebpf.SchedCLS, asm.FnLoop); err != nil {
+		return nil, fmt.Errorf("%w: your kernel version %v does not support bpf_loop (needed by routing); expect >=%v; upgrade your kernel and try again",
+			err,
+			kernelVersion.String(),
+			consts.BpfLoopFeatureVersion.String())
+	}
 	if requirement := consts.ChecksumFeatureVersion; kernelVersion.Less(requirement) {
 		return nil, fmt.Errorf("your kernel version %v does not support checksum related features; expect >=%v; upgrade your kernel and try again",
 			kernelVersion.String(),
 			requirement.String())
 	}
-	if requirement := consts.CgSocketCookieFeatureVersion; len(global.WanInterface) > 0 && kernelVersion.Less(requirement) {
+	if requirement := consts.BpfTimerFeatureVersion; len(global.WanInterface) > 0 && kernelVersion.Less(requirement) {
 		return nil, fmt.Errorf("your kernel version %v does not support bind to WAN; expect >=%v; remove wan_interface in config file and try again",
 			kernelVersion.String(),
 			requirement.String())
@@ -122,6 +136,15 @@ func NewControlPlane(
 	if err = rlimit.RemoveMemlock(); err != nil {
 		return nil, fmt.Errorf("rlimit.RemoveMemlock:%v", err)
 	}
+
+	InitDaeNetns(log)
+	if err = InitSysctlManager(log); err != nil {
+		return nil, err
+	}
+
+	if err = GetDaeNetns().Setup(); err != nil {
+		return nil, fmt.Errorf("failed to setup dae netns: %w", err)
+	}
 	pinPath := filepath.Join(consts.BpfPinRoot, consts.AppName)
 	if err = os.MkdirAll(pinPath, 0755); err != nil && !os.IsExist(err) {
 		if os.IsNotExist(err) {
@@ -138,6 +161,7 @@ func NewControlPlane(
 	//var bpf bpfObjects
 	var ProgramOptions = ebpf.ProgramOptions{
 		KernelTypes: nil,
+		LogSize:     ebpf.DefaultVerifierLogSize * 10,
 	}
 	if log.Level == logrus.PanicLevel {
 		ProgramOptions.LogLevel = ebpf.LogLevelBranch | ebpf.LogLevelStats
@@ -159,8 +183,9 @@ func NewControlPlane(
 	} else {
 		bpf = new(bpfObjects)
 		if err = fullLoadBpfObjects(log, bpf, &loadBpfOptions{
-			PinPath:           pinPath,
-			CollectionOptions: collectionOpts,
+			PinPath:             pinPath,
+			BigEndianTproxyPort: uint32(common.Htons(global.TproxyPort)),
+			CollectionOptions:   collectionOpts,
 		}); err != nil {
 			if log.Level == logrus.PanicLevel {
 				log.Panicln(err)
@@ -186,19 +211,12 @@ func NewControlPlane(
 		}
 	}()
 
-	// Write params.
-	if err = core.bpf.ParamMap.Update(consts.ControlPlanePidKey, uint32(os.Getpid()), ebpf.UpdateAny); err != nil {
-		return nil, err
-	}
-
 	/// Bind to links. Binding should be advance of dialerGroups to avoid un-routable old connection.
 	// Bind to LAN
 	if len(global.LanInterface) > 0 {
-		if err = core.setupRoutingPolicy(); err != nil {
-			return nil, err
-		}
 		if global.AutoConfigKernelParameter {
 			_ = SetIpv4forward("1")
+			_ = setForwarding("all", consts.IpVersionStr_6, "1")
 		}
 		global.LanInterface = common.Deduplicate(global.LanInterface)
 		for _, ifname := range global.LanInterface {
@@ -210,39 +228,42 @@ func NewControlPlane(
 	// Bind to WAN
 	if len(global.WanInterface) > 0 {
 		if err = core.setupSkPidMonitor(); err != nil {
-			return nil, err
+			log.WithError(err).Warnln("cgroup2 is not enabled; pname routing cannot be used")
+		}
+		if global.EnableLocalTcpFastRedirect {
+			if err = core.setupLocalTcpFastRedirect(); err != nil {
+				log.WithError(err).Warnln("failed to setup local tcp fast redirect")
+			}
 		}
 		for _, ifname := range global.WanInterface {
-			if err = core.bindWan(ifname); err != nil {
+			if len(global.LanInterface) > 0 {
+				// FIXME: Code is not elegant here.
+				// bindLan setting conf.ipv6.all.forwarding=1 suppresses accept_ra=1,
+				// thus we set it 2 as a workaround.
+				// See https://sysctl-explorer.net/net/ipv6/accept_ra/ for more information.
+				if global.AutoConfigKernelParameter {
+					acceptRa := sysctl.Keyf("net.ipv6.conf.%v.accept_ra", ifname)
+					val, _ := acceptRa.Get()
+					if val == "1" {
+						_ = acceptRa.Set("2", false)
+					}
+				}
+			}
+			if err = core.bindWan(ifname, global.AutoConfigKernelParameter); err != nil {
 				return nil, fmt.Errorf("bindWan: %v: %w", ifname, err)
 			}
 		}
+	}
+	// Bind to dae0 and dae0peer
+	if err = core.bindDaens(); err != nil {
+		return nil, fmt.Errorf("bindDaens: %w", err)
 	}
 
 	/// DialerGroups (outbounds).
 	if global.AllowInsecure {
 		log.Warnln("AllowInsecure is enabled, but it is not recommended. Please make sure you have to turn it on.")
 	}
-	option := &dialer.GlobalOption{
-		Log: log,
-		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{
-			Raw:             global.TcpCheckUrl,
-			Log:             log,
-			ResolverNetwork: common.MagicNetwork("udp", global.SoMarkFromDae),
-			Method:          global.TcpCheckHttpMethod,
-		},
-		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{
-			Raw:             global.UdpCheckDns,
-			ResolverNetwork: common.MagicNetwork("udp", global.SoMarkFromDae),
-			Somark:          global.SoMarkFromDae,
-		},
-		CheckInterval:     global.CheckInterval,
-		CheckTolerance:    global.CheckTolerance,
-		CheckDnsTcp:       true,
-		AllowInsecure:     global.AllowInsecure,
-		TlsImplementation: global.TlsImplementation,
-		UtlsImitate:       global.UtlsImitate,
-	}
+	option := dialer.NewGlobalOption(global, log)
 
 	// Dial mode.
 	dialMode, err := consts.ParseDialMode(global.DialMode)
@@ -255,9 +276,9 @@ func NewControlPlane(
 	}
 	disableKernelAliveCallback := dialMode != consts.DialMode_Ip
 	_direct, directProperty := dialer.NewDirectDialer(option, true)
-	direct := dialer.NewDialer(_direct, option, dialer.InstanceOption{CheckEnabled: false}, directProperty)
+	direct := dialer.NewDialer(_direct, option, dialer.InstanceOption{DisableCheck: true}, directProperty)
 	_block, blockProperty := dialer.NewBlockDialer(option, func() { /*Dialer Outbound*/ })
-	block := dialer.NewDialer(_block, option, dialer.InstanceOption{CheckEnabled: false}, blockProperty)
+	block := dialer.NewDialer(_block, option, dialer.InstanceOption{DisableCheck: true}, blockProperty)
 	outbounds := []*outbound.DialerGroup{
 		outbound.NewDialerGroup(option, consts.OutboundDirect.String(),
 			[]*dialer.Dialer{direct}, []*dialer.Annotation{{}},
@@ -294,14 +315,26 @@ func NewControlPlane(
 		log.Infof(`Group "%v" node list:`, group.Name)
 		for _, d := range dialers {
 			log.Infoln("\t" + d.Property().Name)
-			// We only activate check of nodes that have a group.
-			d.ActivateCheck()
 		}
 		if len(dialers) == 0 {
 			log.Infoln("\t<Empty>")
 		}
+		groupOption, err := ParseGroupOverrideOption(group, *global, log)
+		finalOption := option
+		if err == nil && groupOption != nil {
+			newDialers := make([]*dialer.Dialer, 0)
+			for _, d := range dialers {
+				newDialer := d.Clone()
+				deferFuncs = append(deferFuncs, newDialer.Close)
+				newDialer.GlobalOption = groupOption
+				newDialers = append(newDialers, newDialer)
+			}
+			log.Infof(`Group "%v"'s check option has been override.`, group.Name)
+			dialers = newDialers
+			finalOption = groupOption
+		}
 		// Create dialer group and append it to outbounds.
-		dialerGroup := outbound.NewDialerGroup(option, group.Name, dialers, annos, *policy,
+		dialerGroup := outbound.NewDialerGroup(finalOption, group.Name, dialers, annos, *policy,
 			core.outboundAliveChangeCallback(uint8(len(outbounds)), disableKernelAliveCallback))
 		outbounds = append(outbounds, dialerGroup)
 	}
@@ -373,6 +406,7 @@ func NewControlPlane(
 		sniffingTimeout:   sniffingTimeout,
 		tproxyPortProtect: global.TproxyPortProtect,
 		soMarkFromDae:     global.SoMarkFromDae,
+		mptcp:             global.Mptcp,
 	}
 	defer func() {
 		if err != nil {
@@ -385,7 +419,7 @@ func NewControlPlane(
 		Logger:                  log,
 		LocationFinder:          locationFinder,
 		UpstreamReadyCallback:   plane.dnsUpstreamReadyCallback,
-		UpstreamResolverNetwork: common.MagicNetwork("udp", global.SoMarkFromDae),
+		UpstreamResolverNetwork: common.MagicNetwork("udp", global.SoMarkFromDae, global.Mptcp),
 	})
 	if err != nil {
 		return nil, err
@@ -422,8 +456,15 @@ func NewControlPlane(
 			}, nil
 		},
 		BestDialerChooser: plane.chooseBestDnsDialer,
-		IpVersionPrefer:   dnsConfig.IpVersionPrefer,
-		FixedDomainTtl:    fixedDomainTtl,
+		TimeoutExceedCallback: func(dialArgument *dialArgument, err error) {
+			dialArgument.bestDialer.ReportUnavailable(&dialer.NetworkType{
+				L4Proto:   dialArgument.l4proto,
+				IpVersion: dialArgument.ipversion,
+				IsDns:     true,
+			}, err)
+		},
+		IpVersionPrefer: dnsConfig.IpVersionPrefer,
+		FixedDomainTtl:  fixedDomainTtl,
 	}); err != nil {
 		return nil, err
 	}
@@ -482,6 +523,36 @@ func ParseFixedDomainTtl(ks []config.KeyableString) (map[string]int, error) {
 		m[strings.TrimSpace(key)] = int(ttl)
 	}
 	return m, nil
+}
+
+func ParseGroupOverrideOption(group config.Group, global config.Global, log *logrus.Logger) (*dialer.GlobalOption, error) {
+	result := global
+	changed := false
+	if group.TcpCheckUrl != nil {
+		result.TcpCheckUrl = group.TcpCheckUrl
+		changed = true
+	}
+	if group.TcpCheckHttpMethod != "" {
+		result.TcpCheckHttpMethod = group.TcpCheckHttpMethod
+		changed = true
+	}
+	if group.UdpCheckDns != nil {
+		result.UdpCheckDns = group.UdpCheckDns
+		changed = true
+	}
+	if group.CheckInterval != 0 {
+		result.CheckInterval = group.CheckInterval
+		changed = true
+	}
+	if group.CheckTolerance != 0 {
+		result.CheckTolerance = group.CheckTolerance
+		changed = true
+	}
+	if changed {
+		option := dialer.NewGlobalOption(&result, log)
+		return option, nil
+	}
+	return nil, nil
 }
 
 // EjectBpf will resect bpf from destroying life-cycle of control plane.
@@ -557,6 +628,14 @@ func (c *ControlPlane) dnsUpstreamReadyCallback(dnsUpstream *dns.Upstream) (err 
 	return nil
 }
 
+func (c *ControlPlane) ActivateCheck() {
+	for _, g := range c.outbounds {
+		for _, d := range g.Dialers {
+			// We only activate check of nodes that have a group.
+			d.ActivateCheck()
+		}
+	}
+}
 func (c *ControlPlane) ChooseDialTarget(outbound consts.OutboundIndex, dst netip.AddrPort, domain string) (dialTarget string, shouldReroute bool, dialIp bool) {
 	dialMode := consts.DialMode_Ip
 
@@ -583,7 +662,7 @@ func (c *ControlPlane) ChooseDialTarget(outbound consts.OutboundIndex, dst netip
 					// TODO: use DNS controller and re-route by control plane.
 					systemDns, err := netutils.SystemDns()
 					if err == nil {
-						if ip46, err := netutils.ResolveIp46(ctx, direct.SymmetricDirect, systemDns, domain, common.MagicNetwork("udp", c.soMarkFromDae), true); err == nil && (ip46.Ip4.IsValid() || ip46.Ip6.IsValid()) {
+						if ip46, err := netutils.ResolveIp46(ctx, direct.SymmetricDirect, systemDns, domain, common.MagicNetwork("udp", c.soMarkFromDae, c.mptcp), true); err == nil && (ip46.Ip4.IsValid() || ip46.Ip6.IsValid()) {
 							// Has A/AAAA records. It is a real domain.
 							dialMode = consts.DialMode_Domain
 							// Add it to real-domain set.
@@ -687,10 +766,6 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 	if err := c.core.bpf.ListenSocketMap.Update(consts.OneKey, uint64(udpFile.Fd()), ebpf.UpdateAny); err != nil {
 		return err
 	}
-	// Port.
-	if err := c.core.bpf.ParamMap.Update(consts.BigEndianTproxyPortKey, uint32(common.Htons(listener.port)), ebpf.UpdateAny); err != nil {
-		return err
-	}
 
 	sentReady = true
 	readyChan <- true
@@ -738,7 +813,15 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			copy(newBuf, buf[:n])
 			newOob := pool.Get(oobn)
 			copy(newOob, oob[:oobn])
-			go func(data pool.PB, oob pool.PB, src netip.AddrPort) {
+			newSrc := src
+			convergeSrc := common.ConvergeAddrPort(src)
+			// Debug:
+			// t := time.Now()
+			DefaultUdpTaskPool.EmitTask(convergeSrc.String(), func() {
+				data := newBuf
+				oob := newOob
+				src := newSrc
+
 				defer data.Put()
 				defer oob.Put()
 				var realDst netip.AddrPort
@@ -746,44 +829,21 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				pktDst := RetrieveOriginalDest(oob)
 				routingResult, err := c.core.RetrieveRoutingResult(src, pktDst, unix.IPPROTO_UDP)
 				if err != nil {
-					// WAN. Old method.
-					lastErr := err
-					addrHdr, dataOffset, err := ParseAddrHdr(data)
-					if err != nil {
-						if c.tproxyPortProtect {
-							c.log.Warnf("No AddrPort presented: %v, %v", lastErr, err)
-							return
-						} else {
-							routingResult = &bpfRoutingResult{
-								Mark:     0,
-								Must:     0,
-								Mac:      [6]uint8{},
-								Outbound: uint8(consts.OutboundControlPlaneRouting),
-								Pname:    [16]uint8{},
-								Pid:      0,
-								Dscp:     0,
-							}
-							realDst = pktDst
-							goto destRetrieved
-						}
-					}
-					data = data[dataOffset:]
-					routingResult = &addrHdr.RoutingResult
-					__ip := common.Ipv6Uint32ArrayToByteSlice(addrHdr.Ip)
-					_ip, _ := netip.AddrFromSlice(__ip)
-					// Comment it because them SHOULD equal.
-					//src = netip.AddrPortFrom(_ip, src.Port())
-					realDst = netip.AddrPortFrom(_ip, addrHdr.Port)
+					c.log.Warnf("No AddrPort presented: %v", err)
+					return
 				} else {
 					realDst = pktDst
 				}
-			destRetrieved:
-				if e := c.handlePkt(udpConn, data, common.ConvergeAddrPort(src), common.ConvergeAddrPort(pktDst), common.ConvergeAddrPort(realDst), routingResult, false); e != nil {
+				if e := c.handlePkt(udpConn, data, convergeSrc, common.ConvergeAddrPort(pktDst), common.ConvergeAddrPort(realDst), routingResult, false); e != nil {
 					c.log.Warnln("handlePkt:", e)
 				}
-			}(newBuf, newOob, src)
+			})
+			// if d := time.Since(t); d > 100*time.Millisecond {
+			// 	logrus.Println(d)
+			// }
 		}
 	}()
+	c.ActivateCheck()
 	<-c.ctx.Done()
 	return nil
 }
@@ -911,6 +971,8 @@ func (c *ControlPlane) chooseBestDnsDialer(
 			"upstream":   dnsUpstream.String(),
 			"choose":     string(l4proto) + "+" + string(ipversion),
 			"use":        bestTarget.String(),
+			"outbound":   bestOutbound.Name,
+			"dialer":     bestDialer.Property().Name,
 		}).Traceln("Choose DNS path")
 	}
 	return &dialArgument{
@@ -920,6 +982,7 @@ func (c *ControlPlane) chooseBestDnsDialer(
 		bestOutbound: bestOutbound,
 		bestTarget:   bestTarget,
 		mark:         dialMark,
+		mptcp:        c.mptcp,
 	}, nil
 }
 

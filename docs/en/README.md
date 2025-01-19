@@ -9,23 +9,27 @@
 Use `uname -r` to check the kernel version on your machine.
 
 > **Note**
-> If you find your kernel version is `< 5.8`, follow the [**Upgrade Guide**](user-guide/kernel-upgrade.md) to upgrade the kernel to the minimum required version.
+> If you find your kernel version is `< 5.17`, follow the [**Upgrade Guide**](user-guide/kernel-upgrade.md) to upgrade the kernel to the minimum required version.
 
-`Bind to LAN: >= 5.8`
+`Bind to LAN: >= 5.17`
 
 You need bind dae to LAN interface, if you want to provide network service for LAN as an intermediate device.
 
-This feature requires the kernel version of machine on which dae install >= 5.8.
+This feature requires the kernel version of machine on which dae install >= 5.17.
 
 Note that if you bind dae to LAN only, dae only provide network service for traffic from LAN, and not impact local programs.
 
-`Bind to WAN: >= 5.8`
+`Bind to WAN: >= 5.17`
 
 You need bind dae to WAN interface, if you want dae to provide network service for local programs.
 
-This feature requires kernel version of the machine >= 5.8.
+This feature requires kernel version of the machine >= 5.17.
 
 Note that if you bind dae to WAN only, dae only provide network service for local programs and not impact traffic coming in from other interfaces.
+
+`Use trace command`
+
+If you want to use `dae trace` command to triage network connectivity issue, the kernel version is required to be >= 5.15.
 
 ## Kernel Configurations
 
@@ -66,25 +70,46 @@ Check them using command like:
 
 > **Note**: `Armbian` users can follow the [**Upgrade Guide**](user-guide/kernel-upgrade.md) to upgrade the kernel to meet the kernel configuration requirement.
 
+> `Arch Linux ARM` users can use [linux-aarch64-7ji](https://github.com/7Ji-PKGBUILDs/linux-aarch64-7ji) which meets the kernel configuration requirement of dae.
+
 ## Installation
 
 ### Arch Linux / Manjaro
 
 dae has been released on [AUR](https://aur.archlinux.org/packages/dae) and [archlinuxcn](https://github.com/archlinuxcn/repo/tree/master/archlinuxcn/dae).
 
-#### Install by AUR Helper
+#### AUR
+
+##### Latest Release
 
 ```shell
 [yay/paru] -S dae
 ```
 
-#### Install Manually
+##### Latest Git Version
 
 ```shell
-pacman -S --needed git base-devel
-git clone https://aur.archlinux.org/dae.git
-cd dae
-makepkg -si
+[yay/paru] -S dae-git
+```
+
+#### archlinuxcn
+
+##### Latest Release (Optimized for x86-64 v3)
+
+```shell
+sudo pacman -S dae-bin-x64-v3
+```
+
+##### Latest Release (General x86-64 or aarch64)
+
+```shell
+sudo pacman -S dae
+```
+
+##### Latest Git Version
+
+```shell
+sudo pacman -S dae-git
 ```
 
 After installation, use systemctl to control it.
@@ -107,6 +132,15 @@ use `app-eselect/eselect-repository` to enable this overlay:
 eselect repository enable gentoo-zh
 emaint sync -r gentoo-zh
 emerge -a net-proxy/dae
+```
+
+### Fedora
+
+dae has been released on [Fedora Copr](https://copr.fedorainfracloud.org/coprs/zhullyb/v2rayA/package/dae).
+
+```shell
+sudo dnf copr enable zhullyb/v2rayA
+sudo dnf install dae
 ```
 
 ### Alpine
@@ -171,11 +205,12 @@ subscription {
 # See https://github.com/daeuniverse/dae/blob/main/docs/en/configuration/dns.md for full examples.
 dns {
   upstream {
-    googledns: 'tcp+udp://dns.google.com:53'
+    googledns: 'tcp+udp://dns.google:53'
     alidns: 'udp://dns.alidns.com:53'
   }
   routing {
     request {
+      qtype(https) -> reject
       fallback: alidns
     }
     response {

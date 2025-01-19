@@ -1,3 +1,8 @@
+/*
+*  SPDX-License-Identifier: AGPL-3.0-only
+*  Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
+ */
+
 package control
 
 import (
@@ -16,7 +21,7 @@ var testPacketSnifferData = []string{
 func TestPacketSniffer_Normal(t *testing.T) {
 	for _, _data := range testPacketSnifferData {
 		data, _ := hex.DecodeString(_data)
-		sniffer, _ := DefaultPacketSnifferPool.GetOrCreate(PacketSnifferKey{
+		sniffer, _ := DefaultPacketSnifferSessionMgr.GetOrCreate(PacketSnifferKey{
 			LAddr: netip.MustParseAddrPort("1.1.1.1:1111"),
 			RAddr: netip.MustParseAddrPort("2.2.2.2:2222"),
 		}, nil)
@@ -39,7 +44,7 @@ func TestPacketSniffer_Mismatched(t *testing.T) {
 	dst := netip.MustParseAddrPort("2.2.2.2:2222")
 	for _, _data := range testPacketSnifferData {
 		data, _ := hex.DecodeString(_data)
-		sniffer, _ := DefaultPacketSnifferPool.GetOrCreate(PacketSnifferKey{
+		sniffer, _ := DefaultPacketSnifferSessionMgr.GetOrCreate(PacketSnifferKey{
 			LAddr: netip.MustParseAddrPort("1.1.1.1:1111"),
 			RAddr: dst,
 		}, nil)

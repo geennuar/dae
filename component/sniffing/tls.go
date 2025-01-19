@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2023, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
  */
 
 package sniffing
@@ -43,7 +43,7 @@ func (s *Sniffer) SniffTls() (d string, err error) {
 	length := int(binary.BigEndian.Uint16(s.buf.Bytes()[3:5]))
 	search := s.buf.Bytes()[5:]
 	if len(search) < length {
-		return "", ErrNotApplicable
+		return "", ErrNeedMore
 	}
 	return extractSniFromTls(quicutils.BuiltinBytesLocator(search[:length]))
 }

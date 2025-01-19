@@ -1,3 +1,8 @@
+/*
+*  SPDX-License-Identifier: AGPL-3.0-only
+*  Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
+ */
+
 package netutils
 
 import (
@@ -6,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/daeuniverse/softwind/protocol/direct"
+	"github.com/daeuniverse/outbound/protocol/direct"
 )
 
 func TestResolveIp46(t *testing.T) {
