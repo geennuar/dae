@@ -2,10 +2,15 @@
 .idea
 *.o
 *.tmp
-bpf_bpfeb*.go
-bpf_bpfel*.go
+bpf*_bpfeb*.go
+bpf*_bpfel*.go
+bpf*_*_bpfeb*.go
+bpf*_*_bpfel*.go
 dae
 outline.json
 go-mod/
 node_modules/
 *.log
+.build_tags
+.checkpatch-camelcase.git.
+venv

@@ -1,9 +1,15 @@
+/*
+*  SPDX-License-Identifier: AGPL-3.0-only
+*  Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
+ */
+
 package cmd
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -15,13 +21,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/daeuniverse/softwind/netproxy"
-	"github.com/daeuniverse/softwind/pkg/fastrand"
-	"github.com/daeuniverse/softwind/protocol/direct"
+	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/protocol/direct"
 	"gopkg.in/natefinch/lumberjack.v2"
+
+	_ "net/http/pprof"
 
 	"github.com/daeuniverse/dae/cmd/internal"
 	"github.com/daeuniverse/dae/common"
+	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/subscription"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
@@ -34,7 +42,8 @@ import (
 )
 
 const (
-	PidFilePath = "/var/run/dae.pid"
+	PidFilePath            = "/var/run/dae.pid"
+	SignalProgressFilePath = "/var/run/dae.progress"
 )
 
 var (
@@ -46,14 +55,14 @@ var (
 )
 
 func init() {
-	runCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "Config file of dae.")
+	runCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "Config file of dae.(required)")
 	runCmd.PersistentFlags().StringVar(&logFile, "logfile", "", "Log file to write. Empty means writing to stdout and stderr.")
 	runCmd.PersistentFlags().IntVar(&logFileMaxSize, "logfile-maxsize", 30, "Unit: MB. The maximum size in megabytes of the log file before it gets rotated.")
 	runCmd.PersistentFlags().IntVar(&logFileMaxBackups, "logfile-maxbackups", 3, "The maximum number of old log files to retain.")
-	runCmd.PersistentFlags().BoolVarP(&disableTimestamp, "disable-timestamp", "", false, "Disable timestamp.")
-	runCmd.PersistentFlags().BoolVarP(&disablePidFile, "disable-pidfile", "", false, "Not generate /var/run/dae.pid.")
-
-	fastrand.Rand().Shuffle(len(CheckNetworkLinks), func(i, j int) {
+	runCmd.PersistentFlags().BoolVar(&disableTimestamp, "disable-timestamp", false, "Disable timestamp.")
+	runCmd.PersistentFlags().BoolVar(&disablePidFile, "disable-pidfile", false, "Not generate /var/run/dae.pid.")
+	runCmd.PersistentFlags().BoolVar(&disableAuthSudo, "disable-sudo", false, "Disable sudo prompt ,may cause startup failure due to insufficient permissions")
+	rand.Shuffle(len(CheckNetworkLinks), func(i, j int) {
 		CheckNetworkLinks[i], CheckNetworkLinks[j] = CheckNetworkLinks[j], CheckNetworkLinks[i]
 	})
 }
@@ -65,6 +74,7 @@ var (
 	logFileMaxBackups int
 	disableTimestamp  bool
 	disablePidFile    bool
+	disableAuthSudo   bool
 
 	runCmd = &cobra.Command{
 		Use:   "run",
@@ -73,9 +83,13 @@ var (
 			if cfgFile == "" {
 				logrus.Fatalln("Argument \"--config\" or \"-c\" is required but not provided.")
 			}
-
+			if disableAuthSudo && os.Geteuid() != 0 {
+				logrus.Fatalln("Auto-sudo is disabled and current user is not root.")
+			}
 			// Require "sudo" if necessary.
-			internal.AutoSu()
+			if !disableAuthSudo {
+				internal.AutoSu()
+			}
 
 			// Read config from --config cfgFile.
 			conf, includes, err := readConfig(cfgFile)
@@ -96,12 +110,13 @@ var (
 					Compress:   true,
 				}
 			}
-			log := logger.NewLogger(conf.Global.LogLevel, disableTimestamp, logOpts)
-			logrus.SetLevel(log.Level)
+			log := logrus.New()
+			logger.SetLogger(log, conf.Global.LogLevel, disableTimestamp, logOpts)
+			logger.SetLogger(logrus.StandardLogger(), conf.Global.LogLevel, disableTimestamp, logOpts)
 
 			log.Infof("Include config files: [%v]", strings.Join(includes, ", "))
 			if err := Run(log, conf, []string{filepath.Dir(cfgFile)}); err != nil {
-				logrus.Fatalln(err)
+				log.Fatalln(err)
 			}
 		},
 	}
@@ -117,6 +132,13 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 		return err
 	}
 
+	var pprofServer *http.Server
+	if conf.Global.PprofPort != 0 {
+		pprofAddr := fmt.Sprintf("localhost:%d", conf.Global.PprofPort)
+		pprofServer = &http.Server{Addr: pprofAddr, Handler: nil}
+		go pprofServer.ListenAndServe()
+	}
+
 	// Serve tproxy TCP/UDP server util signals.
 	var listener *control.Listener
 	sigs := make(chan os.Signal, 1)
@@ -129,13 +151,18 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 			if !disablePidFile {
 				_ = os.WriteFile(PidFilePath, []byte(strconv.Itoa(os.Getpid())), 0644)
 			}
+			_ = os.WriteFile(SignalProgressFilePath, []byte{consts.ReloadDone}, 0644)
 		}()
-		if listener, err = c.ListenAndServe(readyChan, conf.Global.TproxyPort); err != nil {
-			log.Errorln("ListenAndServe:", err)
-		}
+		control.GetDaeNetns().With(func() error {
+			if listener, err = c.ListenAndServe(readyChan, conf.Global.TproxyPort); err != nil {
+				log.Errorln("ListenAndServe:", err)
+			}
+			return err
+		})
 		sigs <- nil
 	}()
 	reloading := false
+	reloadingErr := error(nil)
 	isSuspend := false
 	abortConnections := false
 loop:
@@ -159,6 +186,11 @@ loop:
 				}()
 				<-readyChan
 				sdnotify.Ready()
+				if reloadingErr == nil {
+					_ = os.WriteFile(SignalProgressFilePath, append([]byte{consts.ReloadDone}, []byte("\nOK")...), 0644)
+				} else {
+					_ = os.WriteFile(SignalProgressFilePath, append([]byte{consts.ReloadError}, []byte("\n"+reloadingErr.Error())...), 0644)
+				}
 				log.Warnln("[Reload] Finished")
 			} else {
 				// Listening error.
@@ -175,6 +207,8 @@ loop:
 				log.Warnln("[Reload] Received reload signal; prepare to reload")
 			}
 			sdnotify.Reloading()
+			_ = os.WriteFile(SignalProgressFilePath, []byte{consts.ReloadProcessing}, 0644)
+			reloadingErr = nil
 
 			// Load new config.
 			abortConnections = os.Remove(AbortFile) == nil
@@ -188,6 +222,7 @@ loop:
 						"err": err,
 					}).Errorln("[Reload] Failed to reload")
 					sdnotify.Ready()
+					_ = os.WriteFile(SignalProgressFilePath, append([]byte{consts.ReloadError}, []byte("\n"+err.Error())...), 0644)
 					continue
 				}
 				newConf.Global = deepcopy.Copy(conf.Global).(config.Global)
@@ -202,15 +237,18 @@ loop:
 						"err": err,
 					}).Errorln("[Reload] Failed to reload")
 					sdnotify.Ready()
+					_ = os.WriteFile(SignalProgressFilePath, append([]byte{consts.ReloadError}, []byte("\n"+err.Error())...), 0644)
 					continue
 				}
 				log.Infof("Include config files: [%v]", strings.Join(includes, ", "))
 			}
 			// New logger.
 			oldLogOutput := log.Out
-			log = logger.NewLogger(newConf.Global.LogLevel, disableTimestamp, nil)
+			log = logrus.New()
+			logger.SetLogger(log, newConf.Global.LogLevel, disableTimestamp, nil)
+			logger.SetLogger(logrus.StandardLogger(), newConf.Global.LogLevel, disableTimestamp, nil)
 			log.SetOutput(oldLogOutput) // FIXME: THIS IS A HACK.
-			logrus.SetLevel(log.Level)
+			logrus.SetOutput(oldLogOutput)
 
 			// New control plane.
 			obj := c.EjectBpf()
@@ -222,6 +260,7 @@ loop:
 			log.Warnln("[Reload] Load new control plane")
 			newC, err := newControlPlane(log, obj, dnsCache, newConf, externGeoDataDirs)
 			if err != nil {
+				reloadingErr = err
 				log.WithFields(logrus.Fields{
 					"err": err,
 				}).Errorln("[Reload] Failed to reload; try to roll back configuration")
@@ -255,6 +294,16 @@ loop:
 				oldC.AbortConnections()
 			}
 			oldC.Close()
+
+			if pprofServer != nil {
+				pprofServer.Shutdown(context.Background())
+				pprofServer = nil
+			}
+			if newConf.Global.PprofPort != 0 {
+				pprofAddr := fmt.Sprintf("localhost:%d", conf.Global.PprofPort)
+				pprofServer = &http.Server{Addr: pprofAddr, Handler: nil}
+				go pprofServer.ListenAndServe()
+			}
 		case syscall.SIGHUP:
 			// Ignore.
 			continue
@@ -263,10 +312,11 @@ loop:
 			break loop
 		}
 	}
+	defer os.Remove(PidFilePath)
+	defer control.GetDaeNetns().Close()
 	if e := c.Close(); e != nil {
 		return fmt.Errorf("close control plane: %w", e)
 	}
-	_ = os.Remove(PidFilePath)
 	return nil
 }
 
@@ -283,13 +333,12 @@ func newControlPlane(log *logrus.Logger, bpf interface{}, dnsCache map[string]*c
 	}
 	// Resolve subscriptions to nodes.
 	resolvingfailed := false
-	if !conf.Global.DisableWaitingNetwork && len(conf.Subscription) > 0 {
+	if !conf.Global.DisableWaitingNetwork {
 		epo := 5 * time.Second
 		client := http.Client{
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, network, addr string) (c net.Conn, err error) {
-					cd := netproxy.ContextDialerConverter{Dialer: direct.SymmetricDirect}
-					conn, err := cd.DialContext(ctx, common.MagicNetwork("tcp", conf.Global.SoMarkFromDae), addr)
+					conn, err := direct.SymmetricDirect.DialContext(ctx, common.MagicNetwork("tcp", conf.Global.SoMarkFromDae, conf.Global.Mptcp), addr)
 					if err != nil {
 						return nil, err
 					}
@@ -330,8 +379,7 @@ func newControlPlane(log *logrus.Logger, bpf interface{}, dnsCache map[string]*c
 	client := http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (c net.Conn, err error) {
-				cd := netproxy.ContextDialerConverter{Dialer: direct.SymmetricDirect}
-				conn, err := cd.DialContext(ctx, common.MagicNetwork("tcp", conf.Global.SoMarkFromDae), addr)
+				conn, err := direct.SymmetricDirect.DialContext(ctx, common.MagicNetwork("tcp", conf.Global.SoMarkFromDae, conf.Global.Mptcp), addr)
 				if err != nil {
 					return nil, err
 				}
@@ -354,6 +402,22 @@ func newControlPlane(log *logrus.Logger, bpf interface{}, dnsCache map[string]*c
 			tagToNodeList[tag] = append(tagToNodeList[tag], nodes...)
 		}
 	}
+
+	// Delete all files in persist.d that are not in tagToNodeList
+	files, err := os.ReadDir(filepath.Join(filepath.Dir(cfgFile), "persist.d"))
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	for _, file := range files {
+		tag := strings.TrimSuffix(file.Name(), ".sub")
+		if _, ok := tagToNodeList[tag]; !ok {
+			err := os.Remove(filepath.Join(filepath.Dir(cfgFile), "persist.d", file.Name()))
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	if len(tagToNodeList) == 0 {
 		if resolvingfailed {
 			log.Warnln("No node found because all subscription resolving failed.")

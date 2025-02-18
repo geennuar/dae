@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2023, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
  */
 
 package config
@@ -24,20 +24,27 @@ type Global struct {
 	LogLevel          string `mapstructure:"log_level" default:"info"`
 	// We use DirectTcpCheckUrl to check (tcp)*(ipv4/ipv6) connectivity for direct.
 	//DirectTcpCheckUrl string `mapstructure:"direct_tcp_check_url" default:"http://www.qualcomm.cn/generate_204"`
-	TcpCheckUrl               []string      `mapstructure:"tcp_check_url" default:"http://cp.cloudflare.com,1.1.1.1,2606:4700:4700::1111"`
-	TcpCheckHttpMethod        string        `mapstructure:"tcp_check_http_method" default:"HEAD"` // Use 'HEAD' because some server implementations bypass accounting for this kind of traffic.
-	UdpCheckDns               []string      `mapstructure:"udp_check_dns" default:"dns.google.com:53,8.8.8.8,2001:4860:4860::8888"`
-	CheckInterval             time.Duration `mapstructure:"check_interval" default:"30s"`
-	CheckTolerance            time.Duration `mapstructure:"check_tolerance" default:"0"`
-	LanInterface              []string      `mapstructure:"lan_interface"`
-	WanInterface              []string      `mapstructure:"wan_interface"`
-	AllowInsecure             bool          `mapstructure:"allow_insecure" default:"false"`
-	DialMode                  string        `mapstructure:"dial_mode" default:"domain"`
-	DisableWaitingNetwork     bool          `mapstructure:"disable_waiting_network" default:"false"`
-	AutoConfigKernelParameter bool          `mapstructure:"auto_config_kernel_parameter" default:"false"`
-	SniffingTimeout           time.Duration `mapstructure:"sniffing_timeout" default:"100ms"`
-	TlsImplementation         string        `mapstructure:"tls_implementation" default:"tls"`
-	UtlsImitate               string        `mapstructure:"utls_imitate" default:"chrome_auto"`
+	TcpCheckUrl                []string      `mapstructure:"tcp_check_url" default:"http://cp.cloudflare.com,1.1.1.1,2606:4700:4700::1111"`
+	TcpCheckHttpMethod         string        `mapstructure:"tcp_check_http_method" default:"HEAD"` // Use 'HEAD' because some server implementations bypass accounting for this kind of traffic.
+	UdpCheckDns                []string      `mapstructure:"udp_check_dns" default:"dns.google:53,8.8.8.8,2001:4860:4860::8888"`
+	CheckInterval              time.Duration `mapstructure:"check_interval" default:"30s"`
+	CheckTolerance             time.Duration `mapstructure:"check_tolerance" default:"0"`
+	LanInterface               []string      `mapstructure:"lan_interface"`
+	WanInterface               []string      `mapstructure:"wan_interface"`
+	AllowInsecure              bool          `mapstructure:"allow_insecure" default:"false"`
+	DialMode                   string        `mapstructure:"dial_mode" default:"domain"`
+	DisableWaitingNetwork      bool          `mapstructure:"disable_waiting_network" default:"false"`
+	EnableLocalTcpFastRedirect bool          `mapstructure:"enable_local_tcp_fast_redirect" default:"false"`
+	AutoConfigKernelParameter  bool          `mapstructure:"auto_config_kernel_parameter" default:"false"`
+	// DEPRECATED: not used as of https://github.com/daeuniverse/dae/pull/458
+	AutoConfigFirewallRule bool          `mapstructure:"auto_config_firewall_rule" default:"false"`
+	SniffingTimeout        time.Duration `mapstructure:"sniffing_timeout" default:"100ms"`
+	TlsImplementation      string        `mapstructure:"tls_implementation" default:"tls"`
+	UtlsImitate            string        `mapstructure:"utls_imitate" default:"chrome_auto"`
+	PprofPort              uint16        `mapstructure:"pprof_port" default:"0"`
+	Mptcp                  bool          `mapstructure:"mptcp" default:"false"`
+	BandwidthMaxTx         string        `mapstructure:"bandwidth_max_tx" default:"0"`
+	BandwidthMaxRx         string        `mapstructure:"bandwidth_max_rx" default:"0"`
 }
 
 type Utls struct {
@@ -52,6 +59,12 @@ func FunctionOrStringToFunction(fs FunctionOrString) (f *config_parser.Function)
 		return &config_parser.Function{Name: fs}
 	case *config_parser.Function:
 		return fs
+	case []*config_parser.Function:
+		if len(fs) == 1 {
+			return fs[0]
+		} else {
+			panic(fmt.Sprintf("unknown type of 'fallback' in section routing: %T", fs))
+		}
 	default:
 		panic(fmt.Sprintf("unknown type of 'fallback' in section routing: %T", fs))
 	}
@@ -63,6 +76,8 @@ func FunctionListOrStringToFunctionList(fs FunctionListOrString) (f []*config_pa
 	switch fs := fs.(type) {
 	case string:
 		return []*config_parser.Function{{Name: fs}}
+	case *config_parser.Function:
+		return []*config_parser.Function{fs}
 	case []*config_parser.Function:
 		return fs
 	default:
@@ -76,6 +91,12 @@ type Group struct {
 	Filter           [][]*config_parser.Function `mapstructure:"filter" repeatable:""`
 	FilterAnnotation [][]*config_parser.Param    `mapstructure:"_"`
 	Policy           FunctionListOrString        `mapstructure:"policy" required:""`
+
+	TcpCheckUrl        []string      `mapstructure:"tcp_check_url"`
+	TcpCheckHttpMethod string        `mapstructure:"tcp_check_http_method"`
+	UdpCheckDns        []string      `mapstructure:"udp_check_dns"`
+	CheckInterval      time.Duration `mapstructure:"check_interval"`
+	CheckTolerance     time.Duration `mapstructure:"check_tolerance"`
 }
 
 type DnsRequestRouting struct {

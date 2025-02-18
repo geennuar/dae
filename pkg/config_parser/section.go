@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2023, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
  */
 
 package config_parser
@@ -152,7 +152,11 @@ func (f *Function) String(compact bool, quoteVal bool, omitEmpty bool) string {
 	if !(omitEmpty && len(f.Params) == 0) {
 		builder.WriteString("(")
 		var strParamList []string
-		for _, p := range f.Params {
+		for i, p := range f.Params {
+			if i >= 5 {
+				strParamList = append(strParamList, "...")
+				break
+			}
 			strParamList = append(strParamList, p.String(compact, quoteVal))
 		}
 		if compact {

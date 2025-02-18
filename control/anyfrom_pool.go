@@ -1,3 +1,8 @@
+/*
+*  SPDX-License-Identifier: AGPL-3.0-only
+*  Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
+ */
+
 package control
 
 import (
@@ -33,7 +38,9 @@ func (a *Anyfrom) afterWrite(err error) {
 	a.RefreshTtl()
 }
 func (a *Anyfrom) RefreshTtl() {
-	a.deadlineTimer.Reset(a.ttl)
+	if a.deadlineTimer != nil {
+		a.deadlineTimer.Reset(a.ttl)
+	}
 }
 func (a *Anyfrom) SupportGso(size int) bool {
 	if size > math.MaxUint16 {
@@ -107,7 +114,8 @@ func (a *Anyfrom) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (n int, err 
 // isGSOSupported tests if the kernel supports GSO.
 // Sending with GSO might still fail later on, if the interface doesn't support it (see isGSOError).
 func isGSOSupported(uc *net.UDPConn) bool {
-	// We disable GSO because we haven't thought through how to design to use larger packets.
+	// TODO: We disable GSO because we haven't thought through how to design to use larger packets (we assume the max size of packet is 1500).
+	// See https://github.com/daeuniverse/dae/blob/cab1e4290967340923d7d5ca52b80f781711c18e/control/control_plane.go#L721C37-L721C37.
 	return false
 	conn, err := uc.SyscallConn()
 	if err != nil {
@@ -132,7 +140,7 @@ func isGSOError(err error) bool {
 		// which is a hard requirement of UDP_SEGMENT. See:
 		// https://git.kernel.org/pub/scm/docs/man-pages/man-pages.git/tree/man7/udp.7?id=806eabd74910447f21005160e90957bde4db0183#n228
 		// https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/ipv4/udp.c?h=v6.2&id=c9c3395d5e3dcc6daee66c6908354d47bf98cb0c#n942
-		return serr.Err == unix.EIO
+		return serr.Err == unix.EIO || serr.Err == unix.EINVAL
 	}
 	return false
 }
@@ -184,7 +192,12 @@ func (p *AnyfromPool) GetOrCreate(lAddr string, ttl time.Duration) (conn *Anyfro
 			},
 			KeepAlive: 0,
 		}
-		pc, err := d.ListenPacket(context.Background(), "udp", lAddr)
+		var err error
+		var pc net.PacketConn
+		GetDaeNetns().With(func() error {
+			pc, err = d.ListenPacket(context.Background(), "udp", lAddr)
+			return nil
+		})
 		if err != nil {
 			return nil, true, err
 		}
@@ -196,16 +209,19 @@ func (p *AnyfromPool) GetOrCreate(lAddr string, ttl time.Duration) (conn *Anyfro
 			gotGSOError:   false,
 			gso:           isGSOSupported(uConn),
 		}
-		af.deadlineTimer = time.AfterFunc(ttl, func() {
-			p.mu.Lock()
-			defer p.mu.Unlock()
-			_af := p.pool[lAddr]
-			if _af == af {
-				delete(p.pool, lAddr)
-				af.Close()
-			}
-		})
-		p.pool[lAddr] = af
+
+		if ttl > 0 {
+			af.deadlineTimer = time.AfterFunc(ttl, func() {
+				p.mu.Lock()
+				defer p.mu.Unlock()
+				_af := p.pool[lAddr]
+				if _af == af {
+					delete(p.pool, lAddr)
+					af.Close()
+				}
+			})
+			p.pool[lAddr] = af
+		}
 		return af, true, nil
 	} else {
 		af.RefreshTtl()

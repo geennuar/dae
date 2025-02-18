@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2023, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
  */
 
 package quicutils
@@ -13,7 +13,7 @@ import (
 	"io"
 
 	"github.com/daeuniverse/dae/common"
-	"github.com/daeuniverse/softwind/pool"
+	"github.com/daeuniverse/outbound/pool"
 	"golang.org/x/crypto/hkdf"
 )
 

@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2023, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
  */
 
 package control
@@ -9,13 +9,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"net/netip"
 	"os"
 	"regexp"
 	"sync"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	ciliumLink "github.com/cilium/ebpf/link"
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/consts"
@@ -142,7 +142,7 @@ func (c *controlPlaneCore) mapLinkType(ifname string) error {
 	}
 	var linkHdrLen uint32
 	switch link.Attrs().EncapType {
-	case "none":
+	case "none", "ipip", "ppp", "tun":
 		linkHdrLen = consts.LinkHdrLen_None
 	case "ether":
 		linkHdrLen = consts.LinkHdrLen_Ethernet
@@ -189,138 +189,6 @@ func (c *controlPlaneCore) delQdisc(ifname string) error {
 			return fmt.Errorf("cannot add clsact qdisc: %w", err)
 		}
 	}
-	return nil
-}
-
-func (c *controlPlaneCore) setupRoutingPolicy() (err error) {
-	/// Insert ip rule / ip route.
-	var table = 2023 + c.flip
-
-	/** ip table
-	ip route add local default dev lo table 2023
-	ip -6 route add local default dev lo table 2023
-	*/
-	routes := []netlink.Route{{
-		Scope:     unix.RT_SCOPE_HOST,
-		LinkIndex: consts.LoopbackIfIndex,
-		Dst: &net.IPNet{
-			IP:   []byte{0, 0, 0, 0},
-			Mask: net.CIDRMask(0, 32),
-		},
-		Table: table,
-		Type:  unix.RTN_LOCAL,
-	}, {
-		Scope:     unix.RT_SCOPE_HOST,
-		LinkIndex: consts.LoopbackIfIndex,
-		Dst: &net.IPNet{
-			IP:   []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-			Mask: net.CIDRMask(0, 128),
-		},
-		Table: table,
-		Type:  unix.RTN_LOCAL,
-	}}
-	var routeBadIpv6 bool
-	cleanRoutes := func() error {
-		var errs error
-		for _, route := range routes {
-			if e := netlink.RouteDel(&route); e != nil {
-				if len(route.Dst.IP) == net.IPv6len && routeBadIpv6 {
-					// Not clean for bad ipv6.
-					continue
-				}
-				if errs != nil {
-					errs = fmt.Errorf("%w; %v", errs, e)
-				} else {
-					errs = e
-				}
-			}
-		}
-		if errs != nil {
-			return fmt.Errorf("IpRouteDel(lo): %w", errs)
-		}
-		return nil
-	}
-tryRouteAddAgain:
-	for _, route := range routes {
-		if err = netlink.RouteAdd(&route); err != nil {
-			if os.IsExist(err) {
-				_ = cleanRoutes()
-				goto tryRouteAddAgain
-			}
-			if len(route.Dst.IP) == net.IPv6len {
-				// ipv6
-				c.log.Warnln("IpRouteAdd: Bad IPv6 support. Perhaps your machine disabled IPv6.")
-				routeBadIpv6 = true
-				continue
-			}
-			return fmt.Errorf("IpRouteAdd: %w", err)
-		}
-	}
-	c.deferFuncs = append(c.deferFuncs, cleanRoutes)
-
-	/** ip rule
-	ip rule add fwmark 0x8000000/0x8000000 table 2023
-	ip -6 rule add fwmark 0x8000000/0x8000000 table 2023
-	*/
-	rules := []netlink.Rule{{
-		SuppressIfgroup:   -1,
-		SuppressPrefixlen: -1,
-		Priority:          -1,
-		Goto:              -1,
-		Flow:              -1,
-		Family:            unix.AF_INET,
-		Table:             table,
-		Mark:              int(consts.TproxyMark),
-		Mask:              int(consts.TproxyMark),
-	}, {
-		SuppressIfgroup:   -1,
-		SuppressPrefixlen: -1,
-		Priority:          -1,
-		Goto:              -1,
-		Flow:              -1,
-		Family:            unix.AF_INET6,
-		Table:             table,
-		Mark:              int(consts.TproxyMark),
-		Mask:              int(consts.TproxyMark),
-	}}
-	var ruleBadIpv6 bool
-	cleanRules := func() error {
-		var errs error
-		for _, rule := range rules {
-			if rule.Family == unix.AF_INET6 && ruleBadIpv6 {
-				// Not clean for bad ipv6.
-				continue
-			}
-			if e := netlink.RuleDel(&rule); e != nil {
-				if errs != nil {
-					errs = fmt.Errorf("%w; %v", errs, e)
-				} else {
-					errs = e
-				}
-			}
-		}
-		if errs != nil {
-			return fmt.Errorf("IpRuleDel: %w", errs)
-		}
-		return nil
-	}
-tryRuleAddAgain:
-	for _, rule := range rules {
-		if err = netlink.RuleAdd(&rule); err != nil {
-			if os.IsExist(err) {
-				_ = cleanRules()
-				goto tryRuleAddAgain
-			}
-			if rule.Family == unix.AF_INET6 {
-				// ipv6
-				c.log.Warnln("IpRuleAdd: Bad IPv6 support. Perhaps your machine disabled IPv6 (need CONFIG_IPV6_MULTIPLE_TABLES).")
-				ruleBadIpv6 = true
-				continue
-			}
-			return fmt.Errorf("IpRuleAdd: %w", err)
-		}
-	}
-	c.deferFuncs = append(c.deferFuncs, cleanRules)
 	return nil
 }
 
@@ -472,7 +340,6 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 		return nil
 	})
 
-	// Insert filters.
 	filterEgress := &netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: link.Attrs().Index,
@@ -503,6 +370,7 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 		}
 		return nil
 	})
+
 	return nil
 }
 
@@ -547,7 +415,33 @@ func (c *controlPlaneCore) setupSkPidMonitor() error {
 	return nil
 }
 
-func (c *controlPlaneCore) bindWan(ifname string) error {
+func (c *controlPlaneCore) setupLocalTcpFastRedirect() (err error) {
+	cgroupPath, err := detectCgroupPath()
+	if err != nil {
+		return
+	}
+	cg, err := link.AttachCgroup(link.CgroupOptions{
+		Path:    cgroupPath,
+		Program: c.bpf.LocalTcpSockops, // todo@gray: rename
+		Attach:  ebpf.AttachCGroupSockOps,
+	})
+	if err != nil {
+		return fmt.Errorf("AttachCgroupSockOps: %w", err)
+	}
+	c.deferFuncs = append(c.deferFuncs, cg.Close)
+
+	if err = link.RawAttachProgram(link.RawAttachProgramOptions{
+		Target:  c.bpf.FastSock.FD(),
+		Program: c.bpf.SkMsgFastRedirect,
+		Attach:  ebpf.AttachSkMsgVerdict,
+	}); err != nil {
+		return fmt.Errorf("AttachSkMsgVerdict: %w", err)
+	}
+	return nil
+
+}
+
+func (c *controlPlaneCore) bindWan(ifname string, autoConfigKernelParameter bool) error {
 	return c._bindWan(ifname)
 }
 
@@ -638,12 +532,90 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
 	}
 	c.deferFuncs = append(c.deferFuncs, func() error {
-		if err := netlink.FilterDel(filterIngress); err != nil {
+		if err := netlink.FilterDel(filterIngress); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("FilterDel(%v:%v): %w", ifname, filterIngress.Name, err)
 		}
 		return nil
 	})
+
 	return nil
+}
+
+func (c *controlPlaneCore) bindDaens() (err error) {
+	daens := GetDaeNetns()
+
+	// tproxy_dae0peer_ingress@eth0 at dae netns
+	daens.With(func() error {
+		return c.addQdisc(daens.Dae0Peer().Attrs().Name)
+	})
+	filterDae0peerIngress := &netlink.BpfFilter{
+		FilterAttrs: netlink.FilterAttrs{
+			LinkIndex: daens.Dae0Peer().Attrs().Index,
+			Parent:    netlink.HANDLE_MIN_INGRESS,
+			Handle:    netlink.MakeHandle(0x2022, 0b010+uint16(c.flip)),
+			Protocol:  unix.ETH_P_ALL,
+			Priority:  0,
+		},
+		Fd:           c.bpf.bpfPrograms.TproxyDae0peerIngress.FD(),
+		Name:         consts.AppName + "_dae0peer_ingress",
+		DirectAction: true,
+	}
+	daens.With(func() error {
+		return netlink.FilterDel(filterDae0peerIngress)
+	})
+	// Remove and add.
+	if !c.isReload {
+		// Clean up thoroughly.
+		filterIngressFlipped := deepcopy.Copy(filterDae0peerIngress).(*netlink.BpfFilter)
+		filterIngressFlipped.FilterAttrs.Handle ^= 1
+		daens.With(func() error {
+			return netlink.FilterDel(filterDae0peerIngress)
+		})
+	}
+	if err = daens.With(func() error {
+		return netlink.FilterAdd(filterDae0peerIngress)
+	}); err != nil {
+		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
+	}
+	c.deferFuncs = append(c.deferFuncs, func() error {
+		daens.With(func() error {
+			return netlink.FilterDel(filterDae0peerIngress)
+		})
+		return nil
+	})
+
+	// tproxy_dae0_ingress@dae0 at host netns
+	c.addQdisc(daens.Dae0().Attrs().Name)
+	filterDae0Ingress := &netlink.BpfFilter{
+		FilterAttrs: netlink.FilterAttrs{
+			LinkIndex: daens.Dae0().Attrs().Index,
+			Parent:    netlink.HANDLE_MIN_INGRESS,
+			Handle:    netlink.MakeHandle(0x2022, 0b010+uint16(c.flip)),
+			Protocol:  unix.ETH_P_ALL,
+			Priority:  0,
+		},
+		Fd:           c.bpf.bpfPrograms.TproxyDae0Ingress.FD(),
+		Name:         consts.AppName + "_dae0_ingress",
+		DirectAction: true,
+	}
+	_ = netlink.FilterDel(filterDae0Ingress)
+	// Remove and add.
+	if !c.isReload {
+		// Clean up thoroughly.
+		filterEgressFlipped := deepcopy.Copy(filterDae0Ingress).(*netlink.BpfFilter)
+		filterEgressFlipped.FilterAttrs.Handle ^= 1
+		_ = netlink.FilterDel(filterEgressFlipped)
+	}
+	if err := netlink.FilterAdd(filterDae0Ingress); err != nil {
+		return fmt.Errorf("cannot attach ebpf object to filter egress: %w", err)
+	}
+	c.deferFuncs = append(c.deferFuncs, func() error {
+		if err := netlink.FilterDel(filterDae0Ingress); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("FilterDel(%v:%v): %w", daens.Dae0().Attrs().Name, filterDae0Ingress.Name, err)
+		}
+		return nil
+	})
+	return
 }
 
 // BatchUpdateDomainRouting update bpf map domain_routing. Since one IP may have multiple domains, this function should

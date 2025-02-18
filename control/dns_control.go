@@ -1,15 +1,13 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2023, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
  */
 
 package control
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
-	"io"
 	"math"
 	"net"
 	"net/netip"
@@ -18,16 +16,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/daeuniverse/dae/common"
-
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
-	"github.com/daeuniverse/softwind/netproxy"
-	"github.com/daeuniverse/softwind/pkg/fastrand"
-	"github.com/daeuniverse/softwind/pool"
+	"github.com/daeuniverse/outbound/pkg/fastrand"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/mohae/deepcopy"
 	"github.com/sirupsen/logrus"
@@ -56,13 +50,14 @@ var (
 )
 
 type DnsControllerOption struct {
-	Log                 *logrus.Logger
-	CacheAccessCallback func(cache *DnsCache) (err error)
-	CacheRemoveCallback func(cache *DnsCache) (err error)
-	NewCache            func(fqdn string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
-	BestDialerChooser   func(req *udpRequest, upstream *dns.Upstream) (*dialArgument, error)
-	IpVersionPrefer     int
-	FixedDomainTtl      map[string]int
+	Log                   *logrus.Logger
+	CacheAccessCallback   func(cache *DnsCache) (err error)
+	CacheRemoveCallback   func(cache *DnsCache) (err error)
+	NewCache              func(fqdn string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
+	BestDialerChooser     func(req *udpRequest, upstream *dns.Upstream) (*dialArgument, error)
+	TimeoutExceedCallback func(dialArgument *dialArgument, err error)
+	IpVersionPrefer       int
+	FixedDomainTtl        map[string]int
 }
 
 type DnsController struct {
@@ -76,11 +71,15 @@ type DnsController struct {
 	cacheRemoveCallback func(cache *DnsCache) (err error)
 	newCache            func(fqdn string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
 	bestDialerChooser   func(req *udpRequest, upstream *dns.Upstream) (*dialArgument, error)
+	// timeoutExceedCallback is used to report this dialer is broken for the NetworkType
+	timeoutExceedCallback func(dialArgument *dialArgument, err error)
 
 	fixedDomainTtl map[string]int
 	// mutex protects the dnsCache.
-	dnsCacheMu sync.Mutex
-	dnsCache   map[string]*DnsCache
+	dnsCacheMu          sync.Mutex
+	dnsCache            map[string]*DnsCache
+	dnsForwarderCacheMu sync.Mutex
+	dnsForwarderCache   map[string]DnsForwarder
 }
 
 func parseIpVersionPreference(prefer int) (uint16, error) {
@@ -107,15 +106,18 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		routing:     routing,
 		qtypePrefer: prefer,
 
-		log:                 option.Log,
-		cacheAccessCallback: option.CacheAccessCallback,
-		cacheRemoveCallback: option.CacheRemoveCallback,
-		newCache:            option.NewCache,
-		bestDialerChooser:   option.BestDialerChooser,
+		log:                   option.Log,
+		cacheAccessCallback:   option.CacheAccessCallback,
+		cacheRemoveCallback:   option.CacheRemoveCallback,
+		newCache:              option.NewCache,
+		bestDialerChooser:     option.BestDialerChooser,
+		timeoutExceedCallback: option.TimeoutExceedCallback,
 
-		fixedDomainTtl: option.FixedDomainTtl,
-		dnsCacheMu:     sync.Mutex{},
-		dnsCache:       make(map[string]*DnsCache),
+		fixedDomainTtl:      option.FixedDomainTtl,
+		dnsCacheMu:          sync.Mutex{},
+		dnsCache:            make(map[string]*DnsCache),
+		dnsForwarderCacheMu: sync.Mutex{},
+		dnsForwarderCache:   make(map[string]DnsForwarder),
 	}, nil
 }
 
@@ -162,6 +164,7 @@ func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string
 	cache := c.LookupDnsRespCache(cacheKey, ignoreFixedTtl)
 	if cache != nil {
 		cache.FillInto(msg)
+		msg.Compress = true
 		b, err := msg.Pack()
 		if err != nil {
 			c.log.Warnf("failed to pack: %v", err)
@@ -326,7 +329,6 @@ func (c *DnsController) UpdateDnsCacheTtl(host string, dnsTyp uint16, answers []
 }
 
 type udpRequest struct {
-	lanWanFlag    consts.LanWanFlag
 	realSrc       netip.AddrPort
 	realDst       netip.AddrPort
 	src           netip.AddrPort
@@ -341,13 +343,14 @@ type dialArgument struct {
 	bestOutbound *outbound.DialerGroup
 	bestTarget   netip.AddrPort
 	mark         uint32
+	mptcp        bool
 }
 
 func (c *DnsController) Handle_(dnsMessage *dnsmessage.Msg, req *udpRequest) (err error) {
 	if c.log.IsLevelEnabled(logrus.TraceLevel) && len(dnsMessage.Question) > 0 {
 		q := dnsMessage.Question[0]
 		c.log.Tracef("Received UDP(DNS) %v <-> %v: %v %v",
-			RefineSourceToShow(req.realSrc, req.realDst.Addr(), req.lanWanFlag), req.realDst.String(), strings.ToLower(q.Name), QtypeToString(q.Qtype),
+			RefineSourceToShow(req.realSrc, req.realDst.Addr()), req.realDst.String(), strings.ToLower(q.Name), QtypeToString(q.Qtype),
 		)
 	}
 
@@ -410,7 +413,7 @@ func (c *DnsController) Handle_(dnsMessage *dnsmessage.Msg, req *udpRequest) (er
 	// resp is valid.
 	cache2 := c.LookupDnsRespCache(c.cacheKey(qname, qtype2), true)
 	if c.qtypePrefer == qtype || cache2 == nil || !cache2.IncludeAnyIp() {
-		return sendPkt(resp, req.realDst, req.realSrc, req.src, req.lConn, req.lanWanFlag)
+		return sendPkt(c.log, resp, req.realDst, req.realSrc, req.src, req.lConn)
 	} else {
 		return c.sendReject_(dnsMessage, req)
 	}
@@ -454,14 +457,14 @@ func (c *DnsController) handle_(
 	if resp := c.LookupDnsRespCache_(dnsMessage, cacheKey, false); resp != nil {
 		// Send cache to client directly.
 		if needResp {
-			if err = sendPkt(resp, req.realDst, req.realSrc, req.src, req.lConn, req.lanWanFlag); err != nil {
+			if err = sendPkt(c.log, resp, req.realDst, req.realSrc, req.src, req.lConn); err != nil {
 				return fmt.Errorf("failed to write cached DNS resp: %w", err)
 			}
 		}
 		if c.log.IsLevelEnabled(logrus.DebugLevel) && len(dnsMessage.Question) > 0 {
 			q := dnsMessage.Question[0]
 			c.log.Debugf("UDP(DNS) %v <-> Cache: %v %v",
-				RefineSourceToShow(req.realSrc, req.realDst.Addr(), req.lanWanFlag), strings.ToLower(q.Name), QtypeToString(q.Qtype),
+				RefineSourceToShow(req.realSrc, req.realDst.Addr()), strings.ToLower(q.Name), QtypeToString(q.Qtype),
 			)
 		}
 		return nil
@@ -493,6 +496,7 @@ func (c *DnsController) sendReject_(dnsMessage *dnsmessage.Msg, req *udpRequest)
 	dnsMessage.Response = true
 	dnsMessage.RecursionAvailable = true
 	dnsMessage.Truncated = false
+	dnsMessage.Compress = true
 	if c.log.IsLevelEnabled(logrus.TraceLevel) {
 		c.log.WithFields(logrus.Fields{
 			"question": dnsMessage.Question,
@@ -502,7 +506,7 @@ func (c *DnsController) sendReject_(dnsMessage *dnsmessage.Msg, req *udpRequest)
 	if err != nil {
 		return fmt.Errorf("pack DNS packet: %w", err)
 	}
-	if err = sendPkt(data, req.realDst, req.realSrc, req.src, req.lConn, req.lanWanFlag); err != nil {
+	if err = sendPkt(c.log, data, req.realDst, req.realSrc, req.src, req.lConn); err != nil {
 		return err
 	}
 	return nil
@@ -552,129 +556,40 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 	// the next recursive call. However, a connection cannot be closed twice.
 	// We should set a connClosed flag to avoid it.
 	var connClosed bool
-	var conn netproxy.Conn
 
 	ctxDial, cancel := context.WithTimeout(context.TODO(), consts.DefaultDialTimeout)
 	defer cancel()
-	bestContextDialer := netproxy.ContextDialerConverter{
-		Dialer: dialArgument.bestDialer,
+
+	// get forwarder from cache
+	c.dnsForwarderCacheMu.Lock()
+	forwarder, ok := c.dnsForwarderCache[upstreamName]
+	if !ok {
+		forwarder, err = newDnsForwarder(upstream, *dialArgument)
+		if err != nil {
+			c.dnsForwarderCacheMu.Unlock()
+			return err
+		}
+		c.dnsForwarderCache[upstreamName] = forwarder
+	}
+	c.dnsForwarderCacheMu.Unlock()
+
+	defer func() {
+		if !connClosed {
+			forwarder.Close()
+		}
+	}()
+
+	if err != nil {
+		return err
 	}
 
-	switch dialArgument.l4proto {
-	case consts.L4ProtoStr_UDP:
-		// Get udp endpoint.
-
-		// TODO: connection pool.
-		conn, err = bestContextDialer.DialContext(
-			ctxDial,
-			common.MagicNetwork("udp", dialArgument.mark),
-			dialArgument.bestTarget.String(),
-		)
-		if err != nil {
-			return fmt.Errorf("failed to dial '%v': %w", dialArgument.bestTarget, err)
-		}
-		defer func() {
-			if !connClosed {
-				conn.Close()
-			}
-		}()
-
-		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-		dnsReqCtx, cancelDnsReqCtx := context.WithTimeout(context.TODO(), 5*time.Second)
-		defer cancelDnsReqCtx()
-		go func() {
-			// Send DNS request every seconds.
-			for {
-				_, err = conn.Write(data)
-				if err != nil {
-					if c.log.IsLevelEnabled(logrus.DebugLevel) {
-						c.log.WithFields(logrus.Fields{
-							"to":      dialArgument.bestTarget.String(),
-							"pid":     req.routingResult.Pid,
-							"pname":   ProcessName2String(req.routingResult.Pname[:]),
-							"mac":     Mac2String(req.routingResult.Mac[:]),
-							"from":    req.realSrc.String(),
-							"network": networkType.String(),
-							"err":     err.Error(),
-						}).Debugln("Failed to write UDP(DNS) packet request.")
-					}
-					return
-				}
-				select {
-				case <-dnsReqCtx.Done():
-					return
-				case <-time.After(1 * time.Second):
-				}
-			}
-		}()
-
-		// We can block here because we are in a coroutine.
-		respBuf := pool.GetFullCap(consts.EthernetMtu)
-		defer pool.Put(respBuf)
-		// Wait for response.
-		n, err := conn.Read(respBuf)
-		if err != nil {
-			return fmt.Errorf("failed to read from: %v (dialer: %v): %w", dialArgument.bestTarget, dialArgument.bestDialer.Property().Name, err)
-		}
-		var msg dnsmessage.Msg
-		if err = msg.Unpack(respBuf[:n]); err != nil {
-			return err
-		}
-		respMsg = &msg
-		cancelDnsReqCtx()
-
-	case consts.L4ProtoStr_TCP:
-		// We can block here because we are in a coroutine.
-
-		conn, err = bestContextDialer.DialContext(ctxDial, common.MagicNetwork("tcp", dialArgument.mark), dialArgument.bestTarget.String())
-		if err != nil {
-			return fmt.Errorf("failed to dial proxy to tcp: %w", err)
-		}
-		defer func() {
-			if !connClosed {
-				conn.Close()
-			}
-		}()
-
-		_ = conn.SetDeadline(time.Now().Add(4900 * time.Millisecond))
-		// We should write two byte length in the front of TCP DNS request.
-		bReq := pool.Get(2 + len(data))
-		defer pool.Put(bReq)
-		binary.BigEndian.PutUint16(bReq, uint16(len(data)))
-		copy(bReq[2:], data)
-		_, err = conn.Write(bReq)
-		if err != nil {
-			return fmt.Errorf("failed to write DNS req: %w", err)
-		}
-
-		// Read two byte length.
-		if _, err = io.ReadFull(conn, bReq[:2]); err != nil {
-			return fmt.Errorf("failed to read DNS resp payload length: %w", err)
-		}
-		respLen := int(binary.BigEndian.Uint16(bReq))
-		// Try to reuse the buf.
-		var buf []byte
-		if len(bReq) < respLen {
-			buf = pool.Get(respLen)
-			defer pool.Put(buf)
-		} else {
-			buf = bReq
-		}
-		var n int
-		if n, err = io.ReadFull(conn, buf[:respLen]); err != nil {
-			return fmt.Errorf("failed to read DNS resp payload: %w", err)
-		}
-		var msg dnsmessage.Msg
-		if err = msg.Unpack(buf[:n]); err != nil {
-			return err
-		}
-		respMsg = &msg
-	default:
-		return fmt.Errorf("unexpected l4proto: %v", dialArgument.l4proto)
+	respMsg, err = forwarder.ForwardDNS(ctxDial, data)
+	if err != nil {
+		return err
 	}
 
 	// Close conn before the recursive call.
-	conn.Close()
+	forwarder.Close()
 	connClosed = true
 
 	// Route response.
@@ -735,9 +650,9 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 		}
 		switch upstreamIndex {
 		case consts.DnsResponseOutboundIndex_Accept:
-			c.log.WithFields(fields).Infof("%v <-> %v", RefineSourceToShow(req.realSrc, req.realDst.Addr(), req.lanWanFlag), RefineAddrPortToShow(dialArgument.bestTarget))
+			c.log.WithFields(fields).Infof("%v <-> %v", RefineSourceToShow(req.realSrc, req.realDst.Addr()), RefineAddrPortToShow(dialArgument.bestTarget))
 		case consts.DnsResponseOutboundIndex_Reject:
-			c.log.WithFields(fields).Infof("%v -> reject", RefineSourceToShow(req.realSrc, req.realDst.Addr(), req.lanWanFlag))
+			c.log.WithFields(fields).Infof("%v -> reject", RefineSourceToShow(req.realSrc, req.realDst.Addr()))
 		default:
 			return fmt.Errorf("unknown upstream: %v", upstreamIndex.String())
 		}
@@ -748,11 +663,12 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 	if needResp {
 		// Keep the id the same with request.
 		respMsg.Id = id
+		respMsg.Compress = true
 		data, err = respMsg.Pack()
 		if err != nil {
 			return err
 		}
-		if err = sendPkt(data, req.realDst, req.realSrc, req.src, req.lConn, req.lanWanFlag); err != nil {
+		if err = sendPkt(c.log, data, req.realDst, req.realSrc, req.src, req.lConn); err != nil {
 			return err
 		}
 	}

@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2023, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2024, daeuniverse Organization <dae@v2raya.org>
  */
 
 package consts
@@ -102,7 +102,7 @@ func (i OutboundIndex) IsReserved() bool {
 
 var (
 	MaxMatchSetLen_ = ""
-	MaxMatchSetLen  = 32 * 2
+	MaxMatchSetLen  = 32 * 32
 )
 
 func init() {
@@ -153,22 +153,21 @@ var (
 	SkAssignFeatureVersion                    = internal.Version{5, 7, 0}
 	ChecksumFeatureVersion                    = internal.Version{5, 8, 0}
 	ProgTypeSkLookupFeatureVersion            = internal.Version{5, 9, 0}
+	SockmapFeatureVersion                     = internal.Version{5, 10, 0}
 	UserspaceBatchUpdateLpmTrieFeatureVersion = internal.Version{5, 13, 0}
+	BpfTimerFeatureVersion                    = internal.Version{5, 15, 0}
+	HelperBpfGetFuncIpVersionFeatureVersion   = internal.Version{5, 15, 0}
+	BpfLoopFeatureVersion                     = internal.Version{5, 17, 0}
 )
 
 const (
-	TproxyMark      uint32 = 0x8000000
-	Recognize       uint16 = 0x2017
-	LoopbackIfIndex        = 1
+	TproxyMark       uint32 = 0x08000000
+	TproxyMarkString string = "0x08000000" // Should be aligned with nftables
+	Recognize        uint16 = 0x2017
+	LoopbackIfIndex         = 1
 )
 
 type LanWanFlag uint8
-
-const (
-	LanWanFlag_IsWan LanWanFlag = iota
-	LanWanFlag_IsLan
-	LanWanFlag_NotApplicable
-)
 
 const (
 	LinkHdrLen_None     uint32 = 0
